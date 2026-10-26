@@ -1,0 +1,35 @@
+name: Opt-in
+
+run-name: ${{ format('opt-in {0} result={1}', inputs.slice, inputs.result) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      result:
+        description: "gate result"
+        required: false
+        default: pass
+        type: choice
+        options: [pass, fail]
+      slice:
+        description: "requested slice name"
+        required: false
+        default: "all"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: report
+        env:
+          RESULT: ${{ inputs.result }}
+          SLICE: ${{ inputs.slice }}
+        run: |
+          echo "OPTIN GITHUB_SHA=$GITHUB_SHA GITHUB_REF=$GITHUB_REF RESULT=$RESULT SLICE=$SLICE"
+          [ "$RESULT" = pass ]
