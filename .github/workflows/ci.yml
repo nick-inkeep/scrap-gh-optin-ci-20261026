@@ -1,0 +1,94 @@
+name: CI
+
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('dispatch slice={0} result={1} run_gate={2}', inputs.slice, inputs.result, inputs.run_gate) || format('{0} {1}', github.event_name, github.event.action) }}
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      result:
+        description: "gate result: file (read ctl/<branch>.result), pass, or fail"
+        required: false
+        default: file
+        type: choice
+        options: [file, pass, fail]
+      slice:
+        description: "requested slice name; when set, the requested job runs"
+        required: false
+        default: ""
+        type: string
+      sleep:
+        description: "seconds the gate job sleeps; empty reads ctl/<branch>.sleep"
+        required: false
+        default: ""
+        type: string
+      run_gate:
+        description: "whether the gate job runs in this dispatch"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && format('{0}-dispatch-{1}', github.workflow, github.ref) || format('{0}-{1}', github.workflow, github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  gate:
+    name: gate
+    if: (github.event_name != 'pull_request' || github.event.action != 'labeled' || startsWith(github.event.label.name, 'ci:')) && (github.event_name != 'workflow_dispatch' || inputs.run_gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          IN_RESULT: ${{ inputs.result }}
+          IN_SLICE: ${{ inputs.slice }}
+          IN_SLEEP: ${{ inputs.sleep }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          echo "EVENT=$EVENT_NAME ACTION=$EVENT_ACTION LABEL=$EVENT_LABEL"
+          echo "GITHUB_SHA=$GITHUB_SHA GITHUB_REF=$GITHUB_REF PR_HEAD_SHA=$PR_HEAD_SHA BRANCH=$BRANCH"
+          echo "RUN_ID=$GITHUB_RUN_ID RUN_ATTEMPT=$RUN_ATTEMPT TREE_HEAD=$(git rev-parse HEAD)"
+          echo "LABELS=$(printf '%s' "$LABELS_JSON" | tr -d '\n ')"
+          ctl_result=pass
+          if [ -f "ctl/$BRANCH.result" ]; then ctl_result="$(tr -d '[:space:]' < "ctl/$BRANCH.result")"; fi
+          ctl_sleep=0
+          if [ -f "ctl/$BRANCH.sleep" ]; then ctl_sleep="$(tr -d '[:space:]' < "ctl/$BRANCH.sleep")"; fi
+          result="$ctl_result"; reason=ctl-file
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ -n "$IN_RESULT" ] && [ "$IN_RESULT" != file ]; then result="$IN_RESULT"; reason=dispatch-input; fi
+          if printf '%s' "$LABELS_JSON" | grep -q '"ci:force-pass"'; then result=pass; reason=label-force-pass; fi
+          if printf '%s' "$LABELS_JSON" | grep -q '"ci:force-fail"'; then result=fail; reason=label-force-fail; fi
+          sleep_s="$ctl_sleep"
+          if [ -n "$IN_SLEEP" ]; then sleep_s="$IN_SLEEP"; fi
+          case "$sleep_s" in ''|*[!0-9]*) sleep_s=0;; esac
+          echo "DECISION result=$result reason=$reason sleep=$sleep_s slice=$IN_SLICE"
+          echo "gate: $result ($reason), sleep $sleep_s, GITHUB_SHA $GITHUB_SHA, event $EVENT_NAME $EVENT_ACTION" >> "$GITHUB_STEP_SUMMARY"
+          sleep "$sleep_s"
+          echo "DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          [ "$result" = pass ]
+
+  requested:
+    name: requested ${{ inputs.slice }}
+    if: github.event_name == 'workflow_dispatch' && inputs.slice != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: report
+        env:
+          IN_SLICE: ${{ inputs.slice }}
+        run: |
+          echo "REQUESTED slice=$IN_SLICE GITHUB_SHA=$GITHUB_SHA GITHUB_REF=$GITHUB_REF RUN_ID=$GITHUB_RUN_ID"

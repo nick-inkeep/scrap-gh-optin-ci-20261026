@@ -1,0 +1,60 @@
+name: Comment command
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  checks: write
+  statuses: write
+  actions: write
+  pull-requests: read
+
+jobs:
+  command:
+    name: comment-command
+    if: github.event.issue.pull_request && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) && startsWith(github.event.comment.body, '/ci ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: parse and act
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          AUTHOR_ASSOC: ${{ github.event.comment.author_association }}
+        run: |
+          set -euo pipefail
+          first_line="$(printf '%s\n' "$COMMENT_BODY" | head -n1 | tr -d '\r')"
+          echo "AUTHOR_ASSOC=$AUTHOR_ASSOC GITHUB_SHA=$GITHUB_SHA GITHUB_REF=$GITHUB_REF RUN_ID=$GITHUB_RUN_ID"
+          pr_json="$(gh api "repos/$REPO/pulls/$PR_NUMBER")"
+          head_sha="$(jq -r .head.sha <<<"$pr_json")"
+          head_ref="$(jq -r .head.ref <<<"$pr_json")"
+          head_repo="$(jq -r .head.repo.full_name <<<"$pr_json")"
+          echo "PR_HEAD_SHA=$head_sha PR_HEAD_REF=$head_ref PR_HEAD_REPO=$head_repo"
+          gh api "repos/$REPO/actions/runs/$GITHUB_RUN_ID/jobs" --jq '.jobs[] | "OWN_JOB name=\(.name) head_sha=\(.head_sha) check_run_url=\(.check_run_url)"'
+          re_run='^/ci run ([a-z0-9][a-z0-9:_-]{0,40})$'
+          re_check='^/ci check ([a-z0-9][a-z0-9:_ -]{0,40}) (success|failure|neutral|skipped)$'
+          re_status='^/ci status ([a-z0-9][a-z0-9:_ -]{0,40}) (success|failure|pending|error)$'
+          re_dispatch='^/ci dispatch ([a-z0-9][a-z0-9:_-]{0,40}) (file|pass|fail) (true|false)$'
+          created_fmt='"CREATED_CHECK id=\(.id) name=\(.name) head_sha=\(.head_sha) app=\(.app.slug)/\(.app.id) status=\(.status) conclusion=\(.conclusion)"'
+          if [[ "$first_line" =~ $re_run ]]; then
+            slice="${BASH_REMATCH[1]}"
+            gh api -X POST "repos/$REPO/check-runs" -f name="requested: $slice" -f head_sha="$head_sha" -f status=completed -f conclusion=success -f "output[title]=requested $slice" -f "output[summary]=created by the comment command" --jq "$created_fmt"
+          elif [[ "$first_line" =~ $re_check ]]; then
+            name="${BASH_REMATCH[1]}"; concl="${BASH_REMATCH[2]}"
+            gh api -X POST "repos/$REPO/check-runs" -f name="$name" -f head_sha="$head_sha" -f status=completed -f conclusion="$concl" -f "output[title]=$name" -f "output[summary]=created by the comment command" --jq "$created_fmt"
+          elif [[ "$first_line" =~ $re_status ]]; then
+            ctx="${BASH_REMATCH[1]}"; state="${BASH_REMATCH[2]}"
+            gh api -X POST "repos/$REPO/statuses/$head_sha" -f context="$ctx" -f state="$state" -f description="created by the comment command" --jq '"CREATED_STATUS id=\(.id) context=\(.context) state=\(.state) creator=\(.creator.login)"'
+          elif [[ "$first_line" =~ $re_dispatch ]]; then
+            slice="${BASH_REMATCH[1]}"; result="${BASH_REMATCH[2]}"; run_gate="${BASH_REMATCH[3]}"
+            if [ "$head_repo" != "$REPO" ]; then echo "REFUSED fork head $head_repo"; exit 1; fi
+            gh workflow run ci.yml --repo "$REPO" --ref "$head_ref" -f slice="$slice" -f result="$result" -f run_gate="$run_gate"
+            echo "DISPATCHED ref=$head_ref slice=$slice result=$result run_gate=$run_gate at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          else
+            echo "UNRECOGNIZED command"
+            exit 1
+          fi
